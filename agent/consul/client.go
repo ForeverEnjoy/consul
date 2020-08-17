@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/armon/go-metrics"
+	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/pool"
 	"github.com/hashicorp/consul/agent/router"
 	"github.com/hashicorp/consul/agent/structs"
@@ -421,4 +422,10 @@ func (c *Client) GetLANCoordinate() (lib.CoordinateSet, error) {
 func (c *Client) ReloadConfig(config *Config) error {
 	c.rpcLimiter.Store(rate.NewLimiter(config.RPCRate, config.RPCMaxBurst))
 	return nil
+}
+
+// FindLocalServer will find a healthy server in the local datacenter. If no healthy
+// server is available nil will be returned instead.
+func (c *Client) FindLocalServer() *metadata.Server {
+	return c.routers.FindServer()
 }

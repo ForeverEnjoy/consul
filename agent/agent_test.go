@@ -4510,6 +4510,12 @@ func TestAgent_JoinWAN_viaMeshGateway(t *testing.T) {
 }
 
 func TestAutoConfig_Integration(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Logf("paniced: %v", r)
+			t.FailNow()
+		}
+	}()
 	// eventually this test should really live with integration tests
 	// the goal here is to have one test server and another test client
 	// spin up both agents and allow the server to authorize the auto config

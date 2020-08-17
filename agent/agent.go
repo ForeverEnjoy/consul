@@ -31,11 +31,11 @@ import (
 	autoconf "github.com/hashicorp/consul/agent/auto-config"
 	"github.com/hashicorp/consul/agent/cache"
 	cachetype "github.com/hashicorp/consul/agent/cache-types"
-	certmon "github.com/hashicorp/consul/agent/cert-monitor"
 	"github.com/hashicorp/consul/agent/checks"
 	"github.com/hashicorp/consul/agent/config"
 	"github.com/hashicorp/consul/agent/consul"
 	"github.com/hashicorp/consul/agent/local"
+	"github.com/hashicorp/consul/agent/metadata"
 	"github.com/hashicorp/consul/agent/pool"
 	"github.com/hashicorp/consul/agent/proxycfg"
 	"github.com/hashicorp/consul/agent/structs"
@@ -134,6 +134,7 @@ type delegate interface {
 	LANMembersAllSegments() ([]serf.Member, error)
 	LANSegmentMembers(segment string) ([]serf.Member, error)
 	LocalMember() serf.Member
+	FindLocalServer() *metadata.Server
 	JoinLAN(addrs []string) (n int, err error)
 	RemoveFailedNode(node string, prune bool) error
 	ResolveToken(secretID string) (acl.Authorizer, error)
@@ -161,8 +162,6 @@ type notifier interface {
 // requests to other Consul servers.
 type Agent struct {
 	autoConf *autoconf.AutoConfig
-
-	certMonitor *certmon.CertMonitor
 
 	// config is the agent configuration.
 	config *config.RuntimeConfig
@@ -520,29 +519,16 @@ func New(options ...AgentOption) (*Agent, error) {
 	// pass the agent itself so its safe to move here.
 	a.registerCache()
 
-	cmConf := new(certmon.Config).
-		WithCache(a.cache).
-		WithTLSConfigurator(a.tlsConfigurator).
-		WithDNSSANs(a.config.AutoConfig.DNSSANs).
-		WithIPSANs(a.config.AutoConfig.IPSANs).
-		WithDatacenter(a.config.Datacenter).
-		WithNodeName(a.config.NodeName).
-		WithFallback(a.autoConfigFallbackTLS).
-		WithLogger(a.logger.Named(logging.AutoConfig)).
-		WithTokens(a.tokens).
-		WithPersistence(a.autoConfigPersist)
-	acCertMon, err := certmon.New(cmConf)
-	if err != nil {
-		return nil, err
-	}
-
 	acConf := autoconf.Config{
-		DirectRPC:   a.connPool,
-		Logger:      a.logger,
-		CertMonitor: acCertMon,
+		DirectRPC: a.connPool,
+		Logger:    a.logger,
 		Loader: func(source config.Source) (*config.RuntimeConfig, []string, error) {
 			return config.Load(flat.builderOpts, source, flat.overrides...)
 		},
+		ServerProvider:  &a,
+		TLSConfigurator: a.tlsConfigurator,
+		Cache:           a.cache,
+		Tokens:          a.tokens,
 	}
 	ac, err := autoconf.New(acConf)
 	if err != nil {
@@ -550,6 +536,10 @@ func New(options ...AgentOption) (*Agent, error) {
 	}
 
 	a.autoConf = ac
+
+	// load the tokens
+	a.loadTokens(a.config)
+	a.loadEnterpriseTokens(a.config)
 
 	return &a, nil
 }
@@ -657,11 +647,6 @@ func (a *Agent) Start(ctx context.Context) error {
 		)
 	}
 
-	// load the tokens - this requires the logger to be setup
-	// which is why we can't do this in New
-	a.loadTokens(a.config)
-	a.loadEnterpriseTokens(a.config)
-
 	// create the local state
 	a.State = local.NewState(LocalConfig(c), a.logger, a.tokens)
 
@@ -724,43 +709,6 @@ func (a *Agent) Start(ctx context.Context) error {
 	// and that should be hidden in the state syncer implementation.
 	a.State.Delegate = a.delegate
 	a.State.TriggerSyncChanges = a.sync.SyncChanges.Trigger
-
-	if a.config.AutoEncryptTLS && !a.config.ServerMode {
-		reply, err := a.autoEncryptInitialCertificate(ctx)
-		if err != nil {
-			return fmt.Errorf("AutoEncrypt failed: %s", err)
-		}
-
-		cmConfig := new(certmon.Config).
-			WithCache(a.cache).
-			WithLogger(a.logger.Named(logging.AutoEncrypt)).
-			WithTLSConfigurator(a.tlsConfigurator).
-			WithTokens(a.tokens).
-			WithFallback(a.autoEncryptInitialCertificate).
-			WithDNSSANs(a.config.AutoEncryptDNSSAN).
-			WithIPSANs(a.config.AutoEncryptIPSAN).
-			WithDatacenter(a.config.Datacenter).
-			WithNodeName(a.config.NodeName)
-
-		monitor, err := certmon.New(cmConfig)
-		if err != nil {
-			return fmt.Errorf("AutoEncrypt failed to setup certificate monitor: %w", err)
-		}
-		if err := monitor.Update(reply); err != nil {
-			return fmt.Errorf("AutoEncrypt failed to setup certificate monitor: %w", err)
-		}
-		a.certMonitor = monitor
-
-		// we don't need to worry about ever calling Stop as we have tied the go routines
-		// to the agents lifetime by using the StopCh. Also the agent itself doesn't have
-		// a need of ensuring that the go routine was stopped before performing any action
-		// so we can ignore the chan in the return.
-		if _, err := a.certMonitor.Start(&lib.StopChannelContext{StopCh: a.shutdownCh}); err != nil {
-			return fmt.Errorf("AutoEncrypt failed to start certificate monitor: %w", err)
-		}
-
-		a.logger.Info("automatically upgraded to TLS")
-	}
 
 	if err := a.autoConf.Start(&lib.StopChannelContext{StopCh: a.shutdownCh}); err != nil {
 		return fmt.Errorf("AutoConf failed to start certificate monitor: %w", err)
@@ -862,33 +810,6 @@ func (a *Agent) Start(ctx context.Context) error {
 	}
 
 	return nil
-}
-
-func (a *Agent) autoEncryptInitialCertificate(ctx context.Context) (*structs.SignedResponse, error) {
-	client := a.delegate.(*consul.Client)
-
-	addrs := a.config.StartJoinAddrsLAN
-	disco, err := newDiscover()
-	if err != nil && len(addrs) == 0 {
-		return nil, err
-	}
-	addrs = append(addrs, retryJoinAddrs(disco, retryJoinSerfVariant, "LAN", a.config.RetryJoinLAN, a.logger)...)
-
-	return client.RequestAutoEncryptCerts(ctx, addrs, a.config.ServerPort, a.tokens.AgentToken(), a.config.AutoEncryptDNSSAN, a.config.AutoEncryptIPSAN)
-}
-
-func (a *Agent) autoConfigFallbackTLS(ctx context.Context) (*structs.SignedResponse, error) {
-	if a.autoConf == nil {
-		return nil, fmt.Errorf("AutoConfig manager has not been created yet")
-	}
-	return a.autoConf.FallbackTLS(ctx)
-}
-
-func (a *Agent) autoConfigPersist(resp *structs.SignedResponse) error {
-	if a.autoConf == nil {
-		return fmt.Errorf("AutoConfig manager has not been created yet")
-	}
-	return a.autoConf.RecordUpdatedCerts(resp)
 }
 
 func (a *Agent) listenAndServeGRPC() error {
@@ -1614,11 +1535,6 @@ func (a *Agent) ShutdownAgent() error {
 	// this should help them to be stopped more quickly
 	a.autoConf.Stop()
 
-	if a.certMonitor != nil {
-		// this would be cancelled anyways  (by the closing of the shutdown ch)
-		// but this should help them to be stopped more quickly
-		a.certMonitor.Stop()
-	}
 
 	// Stop the service manager (must happen before we take the stateLock to avoid deadlock)
 	if a.serviceManager != nil {
@@ -4146,6 +4062,13 @@ func (a *Agent) registerCache() {
 // LocalState returns the agent's local state
 func (a *Agent) LocalState() *local.State {
 	return a.State
+}
+
+func (a *Agent) FindLocalServer() *metadata.Server {
+	if a.delegate != nil {
+		return a.delegate.FindLocalServer()
+	}
+	return nil
 }
 
 // rerouteExposedChecks will inject proxy address into check targets

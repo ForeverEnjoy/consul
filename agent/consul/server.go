@@ -1471,6 +1471,13 @@ func (s *Server) DatacenterJoinAddresses(segment string) ([]string, error) {
 	return joinAddrs, nil
 }
 
+// FindLocalServer will find a healthy server in the local datacenter. If no healthy
+// server is available nil will be returned instead.
+func (s *Server) FindLocalServer() *metadata.Server {
+	_, srv, _ := s.router.FindRoute(s.config.Datacenter)
+	return srv
+}
+
 // peersInfoContent is used to help operators understand what happened to the
 // peers.json file. This is written to a file called peers.info in the same
 // location.
